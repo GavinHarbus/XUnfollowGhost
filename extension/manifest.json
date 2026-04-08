@@ -5,8 +5,6 @@
   "description": "Detect who unfollowed you on X/Twitter — track unfollowers and spot blue-verified accounts",
   "permissions": [
     "storage",
-    "alarms",
-    "notifications",
     "tabs"
   ],
   "host_permissions": [

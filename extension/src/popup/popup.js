@@ -33,9 +33,6 @@ const els = {
 
   settingsBtn: $('settings-btn'),
   settingsBackBtn: $('settings-back-btn'),
-  settingAutoScan: $('setting-auto-scan'),
-  settingInterval: $('setting-interval'),
-  settingNotifications: $('setting-notifications'),
   exportBtn: $('export-btn'),
   clearDataBtn: $('clear-data-btn'),
 };
@@ -48,26 +45,21 @@ const UNFOLLOWER_PAGE_SIZE = 20;
 document.addEventListener('DOMContentLoaded', async () => {
   const status = await sendMessage({ type: MSG.GET_STATUS });
 
-  if (!status.hasUserId) {
-    els.setupSection.classList.remove('hidden');
-    els.dashboardSection.classList.add('hidden');
-  } else {
-    els.setupSection.classList.add('hidden');
-    els.dashboardSection.classList.remove('hidden');
+  // Always show dashboard — scan button must be accessible
+  els.setupSection.classList.add('hidden');
+  els.dashboardSection.classList.remove('hidden');
 
-    if (status.screenName) {
-      els.accountName.textContent = `@${status.screenName}`;
-    }
-
-    if (status.isScanning) {
-      showProgress();
-      updateProgress(status.progress || 0, `Resuming scan...`);
-    }
-
-    await loadStats();
-    await loadUnfollowers();
-    await loadSettings();
+  if (status.screenName) {
+    els.accountName.textContent = `@${status.screenName}`;
   }
+
+  if (status.isScanning) {
+    showProgress();
+    updateProgress(status.progress || 0, `Resuming scan...`);
+  }
+
+  await loadStats();
+  await loadUnfollowers();
 
   setupEventListeners();
   setupMessageListener();
@@ -84,7 +76,6 @@ async function loadStats() {
     ? timeAgo(stats.lastScanTimestamp)
     : 'Never';
 
-  // Badge styling
   const badge = els.unfollowerCount;
   if (stats.totalUnfollowers === 0) {
     badge.classList.add('zero');
@@ -147,13 +138,6 @@ async function loadScanHistory() {
   for (const scan of items) {
     els.historyList.appendChild(createHistoryItem(scan));
   }
-}
-
-async function loadSettings() {
-  const settings = await sendMessage({ type: MSG.GET_SETTINGS });
-  els.settingAutoScan.checked = settings.autoScanEnabled;
-  els.settingInterval.value = String(settings.scanIntervalMinutes);
-  els.settingNotifications.checked = settings.notificationsEnabled;
 }
 
 // --- UI Rendering ---
@@ -236,11 +220,10 @@ function setupEventListeners() {
   // History toggle
   els.historyToggle.addEventListener('click', () => {
     const body = els.historyList;
-    const header = els.historyToggle;
     const isHidden = body.classList.contains('hidden');
 
     body.classList.toggle('hidden');
-    header.classList.toggle('expanded', isHidden);
+    els.historyToggle.classList.toggle('expanded', isHidden);
 
     if (isHidden) {
       loadScanHistory();
@@ -259,11 +242,6 @@ function setupEventListeners() {
     els.dashboardSection.classList.remove('hidden');
   });
 
-  // Setting changes
-  els.settingAutoScan.addEventListener('change', saveSettings);
-  els.settingInterval.addEventListener('change', saveSettings);
-  els.settingNotifications.addEventListener('change', saveSettings);
-
   // Export
   els.exportBtn.addEventListener('click', async () => {
     const result = await sendMessage({ type: MSG.EXPORT_CSV });
@@ -280,17 +258,6 @@ function setupEventListeners() {
       els.setupSection.classList.remove('hidden');
       els.dashboardSection.classList.add('hidden');
     }
-  });
-}
-
-async function saveSettings() {
-  await sendMessage({
-    type: MSG.UPDATE_SETTINGS,
-    settings: {
-      autoScanEnabled: els.settingAutoScan.checked,
-      scanIntervalMinutes: parseInt(els.settingInterval.value, 10),
-      notificationsEnabled: els.settingNotifications.checked,
-    },
   });
 }
 
@@ -313,6 +280,10 @@ function setupMessageListener() {
         hideProgress();
         els.scanBtn.disabled = false;
 
+        // After first scan, switch from setup to dashboard
+        els.setupSection.classList.add('hidden');
+        els.dashboardSection.classList.remove('hidden');
+
         if (message.isFirstScan) {
           els.firstScanMsg.classList.remove('hidden');
           setTimeout(() => els.firstScanMsg.classList.add('hidden'), 8000);
@@ -326,10 +297,7 @@ function setupMessageListener() {
         hideProgress();
         els.scanBtn.disabled = false;
 
-        if (message.error === 'no_user_id') {
-          els.dashboardSection.classList.add('hidden');
-          els.setupSection.classList.remove('hidden');
-        } else if (message.error !== 'cancelled') {
+        if (message.error !== 'cancelled') {
           alert(`Scan failed: ${message.error || message.message}`);
         }
         break;

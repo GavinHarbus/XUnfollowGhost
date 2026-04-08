@@ -20,17 +20,14 @@ import {
 } from '../lib/diff-engine.js';
 import {
   DEFAULT_SETTINGS,
-  SCAN_ALARM_NAME,
   STORAGE_KEYS,
 } from '../lib/constants.js';
 import { MSG } from '../lib/messages.js';
 
 // --- State ---
 
-// Accumulated followers from SCAN_BATCH messages during an active scan
 let scanFollowers = [];
 let activeScanTabId = null;
-let autoCreatedTab = false;
 
 // --- Initialization ---
 
@@ -45,43 +42,15 @@ chrome.runtime.onInstalled.addListener(async (details) => {
         totalFetched: 0,
         startedAt: null,
       },
-      [STORAGE_KEYS.AUTH_CONFIG]: {
-        bearerToken: null,
-        followersQueryId: null,
-        userId: null,
-        screenName: null,
-      },
     });
     await openDB();
   }
-  await setupAlarm();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   const { scanState } = await chrome.storage.local.get(STORAGE_KEYS.SCAN_STATE);
   if (scanState?.isScanning) {
     await updateScanState({ isScanning: false, progress: 0 });
-  }
-  await setupAlarm();
-});
-
-// --- Alarm ---
-
-async function setupAlarm() {
-  const { settings } = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
-  const s = settings || DEFAULT_SETTINGS;
-  await chrome.alarms.clear(SCAN_ALARM_NAME);
-  if (s.autoScanEnabled) {
-    chrome.alarms.create(SCAN_ALARM_NAME, {
-      delayInMinutes: s.scanIntervalMinutes,
-      periodInMinutes: s.scanIntervalMinutes,
-    });
-  }
-}
-
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === SCAN_ALARM_NAME) {
-    await runScan({ fromAlarm: true });
   }
 });
 
@@ -99,11 +68,6 @@ async function getScanState() {
   return scanState || { isScanning: false };
 }
 
-async function getAuthConfig() {
-  const { authConfig } = await chrome.storage.local.get(STORAGE_KEYS.AUTH_CONFIG);
-  return authConfig || {};
-}
-
 async function getSettings() {
   const { settings } = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
   return settings || DEFAULT_SETTINGS;
@@ -113,63 +77,24 @@ function broadcastToPopup(message) {
   chrome.runtime.sendMessage(message).catch(() => {});
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// --- Find x.com tab ---
 
-// --- Tab Management ---
-
-async function findOrCreateXTab(createIfMissing) {
+async function findXTab() {
   const tabs = await chrome.tabs.query({ url: 'https://x.com/*' });
   if (tabs.length > 0) {
-    return { tabId: tabs[0].id, autoCreated: false };
+    return tabs[0].id;
   }
-
-  if (!createIfMissing) {
-    return null;
-  }
-
-  // Create a background tab for auto-scan
-  const tab = await chrome.tabs.create({ url: 'https://x.com', active: false });
-  await new Promise((resolve) => {
-    function onUpdated(tabId, changeInfo) {
-      if (tabId === tab.id && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        resolve();
-      }
-    }
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      resolve();
-    }, 30000);
-  });
-  // Wait for content script to inject
-  await sleep(2000);
-  return { tabId: tab.id, autoCreated: true };
+  return null;
 }
 
 // --- Core Scan ---
 
-async function runScan({ fromAlarm = false } = {}) {
+async function runScan() {
   const state = await getScanState();
   if (state.isScanning) return;
 
-  const authConfig = await getAuthConfig();
-  const userId = authConfig.userId;
-
-  if (!userId) {
-    broadcastToPopup({
-      type: MSG.SCAN_ERROR,
-      error: 'no_user_id',
-      message: 'Please visit x.com first to connect your account.',
-    });
-    return;
-  }
-
-  // Find an x.com tab (create one only for alarm-triggered scans)
-  const tabInfo = await findOrCreateXTab(fromAlarm);
-  if (!tabInfo) {
+  const tabId = await findXTab();
+  if (!tabId) {
     broadcastToPopup({
       type: MSG.SCAN_ERROR,
       error: 'no_tab',
@@ -178,12 +103,8 @@ async function runScan({ fromAlarm = false } = {}) {
     return;
   }
 
-  activeScanTabId = tabInfo.tabId;
-  autoCreatedTab = tabInfo.autoCreated;
+  activeScanTabId = tabId;
   scanFollowers = [];
-
-  // Save scan context
-  const previousSnapshot = await getLatestSnapshot(userId);
 
   const scanRecordId = await addScanRecord({
     startedAt: Date.now(),
@@ -203,8 +124,6 @@ async function runScan({ fromAlarm = false } = {}) {
     totalFetched: 0,
     startedAt: Date.now(),
     scanRecordId,
-    previousSnapshotId: previousSnapshot?.id || null,
-    userId,
   });
 
   broadcastToPopup({
@@ -218,8 +137,6 @@ async function runScan({ fromAlarm = false } = {}) {
   try {
     await chrome.tabs.sendMessage(activeScanTabId, {
       type: MSG.PAGE_START_SCAN,
-      userId,
-      queryId: authConfig.followersQueryId || null,
     });
   } catch (e) {
     await updateScanRecord(scanRecordId, {
@@ -228,22 +145,12 @@ async function runScan({ fromAlarm = false } = {}) {
       error: 'Failed to start scan: ' + e.message,
     });
     await updateScanState({ isScanning: false, progress: 0 });
-    await cleanupTab();
+    activeScanTabId = null;
     broadcastToPopup({
       type: MSG.SCAN_ERROR,
       error: 'Failed to communicate with x.com tab. Please refresh the page and try again.',
     });
   }
-}
-
-async function cleanupTab() {
-  if (autoCreatedTab && activeScanTabId) {
-    try {
-      await chrome.tabs.remove(activeScanTabId);
-    } catch { /* tab may already be closed */ }
-  }
-  activeScanTabId = null;
-  autoCreatedTab = false;
 }
 
 // --- Scan Event Handlers (from page world) ---
@@ -269,29 +176,20 @@ async function handleScanPageDone(message) {
     totalFetched: message.fetched,
   });
 
-  if (message.rateLimited) {
-    broadcastToPopup({
-      type: MSG.SCAN_PROGRESS,
-      progress: -1,
-      message: `Rate limited. Waiting ${Math.round(message.backoffMs / 1000)}s...`,
-      fetched: message.fetched,
-      page: message.page,
-    });
-  } else {
-    broadcastToPopup({
-      type: MSG.SCAN_PROGRESS,
-      progress,
-      fetched: message.fetched,
-      page: message.page,
-    });
-  }
+  broadcastToPopup({
+    type: MSG.SCAN_PROGRESS,
+    progress,
+    fetched: message.fetched,
+    page: message.page,
+  });
+
   return { ok: true };
 }
 
 async function handleScanFinished(message) {
   const scanState = await getScanState();
   const scanRecordId = scanState.scanRecordId;
-  const userId = scanState.userId;
+  const ownerScreenName = message.ownerScreenName;
 
   if (message.cancelled) {
     if (scanRecordId) {
@@ -303,51 +201,54 @@ async function handleScanFinished(message) {
       });
     }
     await updateScanState({ isScanning: false, progress: 0 });
-    await cleanupTab();
+    activeScanTabId = null;
     broadcastToPopup({ type: MSG.SCAN_ERROR, error: 'cancelled' });
     scanFollowers = [];
     return { ok: true };
   }
 
-  // Use allUsers from the finished message (complete data from page world)
   const allFollowers = message.allUsers || scanFollowers;
 
   try {
+    // Store ownerScreenName for future stats lookups
+    const settings = await getSettings();
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.SETTINGS]: {
+        ...settings,
+        lastScanTimestamp: Date.now(),
+        ownerScreenName,
+      },
+    });
+
     // Build new snapshot
-    const newSnapshot = computeSnapshotFromFollowers(userId, allFollowers);
+    const newSnapshot = computeSnapshotFromFollowers(ownerScreenName, allFollowers);
     await addSnapshot(newSnapshot);
 
     // Get previous snapshot for diff
-    const previousSnapshot = await getSecondLatestSnapshot(userId);
+    const previousSnapshot = await getSecondLatestSnapshot(ownerScreenName);
 
-    let unfollowedIds = [];
-    let newFollowerIds = [];
+    let unfollowedScreenNames = [];
+    let newFollowerScreenNames = [];
     const isFirstScan = !previousSnapshot;
 
     if (previousSnapshot) {
       const diff = diffSnapshots(previousSnapshot, newSnapshot);
-      unfollowedIds = diff.unfollowedIds;
-      newFollowerIds = diff.newFollowerIds;
+      unfollowedScreenNames = diff.unfollowedScreenNames;
+      newFollowerScreenNames = diff.newFollowerScreenNames;
 
-      if (unfollowedIds.length > 0) {
+      if (unfollowedScreenNames.length > 0) {
         const unfollowerRecords = [];
-        for (const uid of unfollowedIds) {
-          const profile = await getFollower(uid);
+        for (const sn of unfollowedScreenNames) {
+          const profile = await getFollower(sn);
           unfollowerRecords.push({
-            userId: uid,
-            screenName: profile?.screenName || 'unknown',
-            displayName: profile?.displayName || 'Unknown User',
+            screenName: sn,
+            displayName: profile?.displayName || sn,
             avatarUrl: profile?.avatarUrl || '',
             isBlueVerified: profile?.isBlueVerified || false,
             detectedAt: Date.now(),
-            snapshotId: newSnapshot.id,
           });
         }
         await addUnfollowers(unfollowerRecords);
-      }
-
-      if (unfollowedIds.length > 0) {
-        await sendNotification(unfollowedIds.length);
       }
     }
 
@@ -357,23 +258,17 @@ async function handleScanFinished(message) {
         completedAt: Date.now(),
         status: 'completed',
         totalFollowers: allFollowers.length,
-        newFollowersCount: newFollowerIds.length,
-        unfollowersCount: unfollowedIds.length,
+        newFollowersCount: newFollowerScreenNames.length,
+        unfollowersCount: unfollowedScreenNames.length,
         pagesScanned: message.totalPages,
       });
     }
 
-    // Update last scan timestamp
-    const settings = await getSettings();
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.SETTINGS]: { ...settings, lastScanTimestamp: Date.now() },
-    });
-
     broadcastToPopup({
       type: MSG.SCAN_COMPLETE,
       totalFollowers: allFollowers.length,
-      unfollowers: unfollowedIds.length,
-      newFollowers: newFollowerIds.length,
+      unfollowers: unfollowedScreenNames.length,
+      newFollowers: newFollowerScreenNames.length,
       isFirstScan,
     });
   } catch (error) {
@@ -390,7 +285,7 @@ async function handleScanFinished(message) {
     broadcastToPopup({ type: MSG.SCAN_ERROR, error: error.message });
   } finally {
     await updateScanState({ isScanning: false, progress: 0 });
-    await cleanupTab();
+    activeScanTabId = null;
     scanFollowers = [];
   }
 
@@ -410,27 +305,12 @@ async function handleScanPageError(message) {
   }
 
   await updateScanState({ isScanning: false, progress: 0 });
-  await cleanupTab();
+  activeScanTabId = null;
   scanFollowers = [];
 
   const errorMsg = message.message || message.error || 'Scan failed';
   broadcastToPopup({ type: MSG.SCAN_ERROR, error: errorMsg });
   return { ok: true };
-}
-
-// --- Notifications ---
-
-async function sendNotification(count) {
-  const settings = await getSettings();
-  if (!settings.notificationsEnabled) return;
-
-  chrome.notifications.create({
-    type: 'basic',
-    iconUrl: chrome.runtime.getURL('assets/icons/icon128.png'),
-    title: 'XUnfollowGhost',
-    message: `${count} user${count > 1 ? 's' : ''} unfollowed you!`,
-    priority: 2,
-  });
 }
 
 // --- CSV Export ---
@@ -440,7 +320,7 @@ async function generateCsvExport() {
   let csv = 'Screen Name,Display Name,Blue Verified,Detected At\n';
   for (const u of unfollowers) {
     const date = new Date(u.detectedAt).toISOString();
-    csv += `@${u.screenName},${u.displayName.replace(/,/g, ' ')},${u.isBlueVerified},${date}\n`;
+    csv += `@${u.screenName},${(u.displayName || '').replace(/,/g, ' ')},${u.isBlueVerified},${date}\n`;
   }
   return csv;
 }
@@ -456,19 +336,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleMessage(message) {
   switch (message.type) {
-    case MSG.AUTH_CAPTURED:
-      return handleAuthCaptured(message);
-
-    case MSG.USER_IDENTIFIED:
-      return handleUserIdentified(message);
-
     case MSG.START_SCAN: {
-      runScan(); // Fire and forget
+      runScan();
       return { started: true };
     }
 
     case MSG.CANCEL_SCAN: {
-      // Forward cancel to page world via content script
       if (activeScanTabId) {
         try {
           await chrome.tabs.sendMessage(activeScanTabId, {
@@ -494,11 +367,11 @@ async function handleMessage(message) {
 
     case MSG.GET_STATUS: {
       const scanState = await getScanState();
-      const authConfig = await getAuthConfig();
+      const settings = await getSettings();
       return {
         ...scanState,
-        hasUserId: !!authConfig.userId,
-        screenName: authConfig.screenName,
+        hasScreenName: !!settings.ownerScreenName,
+        screenName: settings.ownerScreenName,
       };
     }
 
@@ -519,27 +392,12 @@ async function handleMessage(message) {
     }
 
     case MSG.GET_STATS: {
-      const authConfig = await getAuthConfig();
-      const stats = await getStats(authConfig.userId);
       const settings = await getSettings();
+      const stats = await getStats(settings.ownerScreenName);
       return {
         ...stats,
         lastScanTimestamp: settings.lastScanTimestamp,
       };
-    }
-
-    case MSG.UPDATE_SETTINGS: {
-      const currentSettings = await getSettings();
-      const newSettings = { ...currentSettings, ...message.settings };
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.SETTINGS]: newSettings,
-      });
-      await setupAlarm();
-      return { success: true };
-    }
-
-    case MSG.GET_SETTINGS: {
-      return getSettings();
     }
 
     case MSG.CLEAR_ALL_DATA: {
@@ -558,47 +416,4 @@ async function handleMessage(message) {
     default:
       return null;
   }
-}
-
-async function handleAuthCaptured(message) {
-  const authConfig = await getAuthConfig();
-  const updates = {};
-
-  if (message.bearerToken) {
-    updates.bearerToken = message.bearerToken;
-  }
-  if (message.queryId && message.operationName === 'Followers') {
-    updates.followersQueryId = message.queryId;
-  }
-  if (message.csrfToken) {
-    updates.csrfToken = message.csrfToken;
-  }
-
-  if (Object.keys(updates).length > 0) {
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.AUTH_CONFIG]: { ...authConfig, ...updates },
-    });
-  }
-
-  return { success: true };
-}
-
-async function handleUserIdentified(message) {
-  const authConfig = await getAuthConfig();
-  const updates = {};
-
-  if (message.userId) {
-    updates.userId = message.userId;
-  }
-  if (message.screenName) {
-    updates.screenName = message.screenName;
-  }
-
-  if (Object.keys(updates).length > 0) {
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.AUTH_CONFIG]: { ...authConfig, ...updates },
-    });
-  }
-
-  return { success: true };
 }

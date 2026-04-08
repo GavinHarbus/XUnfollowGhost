@@ -20,14 +20,13 @@
 
 ## Features
 
-- **Detect Unfollowers** — Automatically compares follower snapshots to find who left
+- **Detect Unfollowers** — Compares follower snapshots to find who left
 - **Blue Verified Badge** — Highlights unfollowers who are X Premium (blue checkmark) subscribers
-- **Auto Scan** — Configurable periodic scanning (1h / 3h / 6h / 12h / 24h)
-- **Desktop Notifications** — Get alerted instantly when someone unfollows
+- **Manual Scan** — You control when to scan, no background activity
 - **Rich Dashboard** — Dark-themed UI matching X's design, with stats, avatars, and profile links
 - **Scan History** — Full history of all scans with follower counts and changes
 - **CSV Export** — Export your unfollower data for further analysis
-- **No API Key Required** — Works with your existing X login session, zero configuration
+- **No API Key Required** — Reads the rendered page directly, zero configuration
 - **Privacy First** — All data stored locally in your browser. Nothing is sent to any server.
 
 ## Screenshots
@@ -36,7 +35,7 @@
 
 | Dashboard | Unfollower List | Settings |
 |:---------:|:---------------:|:--------:|
-| Stats overview with follower count, unfollower count, and scan history | Unfollower cards with avatar, name, blue-V badge, and detection time | Auto-scan interval, notifications, CSV export, and data management |
+| Stats overview with follower count, unfollower count, and scan history | Unfollower cards with avatar, name, blue-V badge, and detection time | CSV export, and data management |
 
 </div>
 
@@ -62,64 +61,60 @@
 
 ### First Use
 
-1. **Visit [x.com](https://x.com)** — The extension automatically captures your authentication
+1. **Visit [x.com](https://x.com)** and make sure you are logged in
 2. **Click the extension icon** in the toolbar to open the popup
-3. **Click "Scan Now"** — Your first scan builds a baseline snapshot of your followers
-4. **Wait for the next scan** (or click Scan Now again) — The extension will compare the new snapshot against the baseline and show who unfollowed you
+3. **Click "Scan Now"** — The extension auto-navigates to your followers page, scrolls through it, and builds a baseline snapshot
+4. **Click "Scan Now" again later** — The extension compares the new snapshot against the previous one and shows who unfollowed you
 
 > **Note:** The first scan only establishes a baseline. Unfollowers will be detected starting from the second scan.
 
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Your Browser                      │
-│                                                      │
-│  ┌──────────┐    Auth Tokens    ┌─────────────────┐ │
-│  │  x.com   │ ───────────────> │  Service Worker  │ │
-│  │  (tab)   │   content script  │  (Background)    │ │
-│  └──────────┘                   │                   │ │
-│                                 │  1. Fetch all     │ │
-│  ┌──────────┐   Stats & Data   │     followers     │ │
-│  │  Popup   │ <──────────────> │  2. Save snapshot │ │
-│  │  (UI)    │   messages        │  3. Diff with     │ │
-│  └──────────┘                   │     previous      │ │
-│                                 │  4. Find ghosts!  │ │
-│                                 └────────┬──────────┘ │
-│                                          │             │
-│                                 ┌────────▼──────────┐ │
-│                                 │    IndexedDB      │ │
-│                                 │  (Local Storage)  │ │
-│                                 └───────────────────┘ │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      Your Browser                         │
+│                                                           │
+│  ┌──────────────┐                 ┌───────────────────┐  │
+│  │   x.com tab  │  postMessage    │  Content Script   │  │
+│  │              │ ──────────────> │  (ISOLATED world) │  │
+│  │  ┌────────┐  │                 │  message bridge    │  │
+│  │  │ Page   │  │                 └────────┬──────────┘  │
+│  │  │Scanner │  │                          │ chrome       │
+│  │  │(MAIN)  │  │                          │ .runtime     │
+│  │  │        │  │                 ┌────────▼──────────┐  │
+│  │  │ 1.Navigate to              │  Service Worker    │  │
+│  │  │   /followers │              │  (Background)      │  │
+│  │  │ 2.Parse DOM  │  ┌────────┐ │                    │  │
+│  │  │ 3.Scroll ↓   │  │ Popup  │ │  1. Store followers│  │
+│  │  │ 4.Repeat     │  │ (UI)   │<│> 2. Save snapshot  │  │
+│  │  └────────┘  │  └────────┘ │  3. Diff with prev │  │
+│  └──────────────┘              │  4. Find ghosts!   │  │
+│                                └────────┬──────────┘  │
+│                                         │              │
+│                                ┌────────▼──────────┐  │
+│                                │    IndexedDB       │  │
+│                                │  (Local Storage)   │  │
+│                                └───────────────────┘  │
+└──────────────────────────────────────────────────────────┘
 ```
+
+### DOM-Parse Approach
+
+XUnfollowGhost does **not** call any X API. Instead, it:
+
+1. **Navigates** to your `/{screenName}/followers` page automatically
+2. **Parses the rendered DOM** — reads `[data-testid="UserCell"]` elements to extract screen name, display name, avatar, and verified badge
+3. **Scrolls down** to trigger X's infinite scroll, loading more followers
+4. **Uses MutationObserver** to detect when new content appears (with a 5-second timeout fallback)
+5. **Stops** after 5 consecutive scroll rounds with no new users
+
+This means the extension is resilient to API changes — it reads what you see on the page.
 
 ### The Snapshot Diff Algorithm
 
-XUnfollowGhost uses a simple but effective approach:
-
-1. **Snapshot** — Each scan fetches your complete follower list and saves it as a sorted array of user IDs
+1. **Snapshot** — Each scan collects your complete follower list and saves it as a sorted array of screen names
 2. **Diff** — A two-pointer merge algorithm compares the previous and current snapshots in O(n+m) time
-3. **Result** — IDs in the previous snapshot but not in the current one = **unfollowers**
-
-### Authentication
-
-The extension **does not require an X API key**. Instead, it:
-
-1. Injects a lightweight script into X's page context
-2. Captures the Bearer token and CSRF token from X's own outgoing requests
-3. Uses these tokens (along with your browser cookies) to call X's internal GraphQL API
-4. All authentication stays within your browser — nothing is sent externally
-
-## Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Auto-scan | Enabled | Periodically check for unfollowers |
-| Scan Interval | 6 hours | How often to scan (1h / 3h / 6h / 12h / 24h) |
-| Notifications | Enabled | Desktop alerts when unfollowers are detected |
-
-All settings are accessible via the gear icon in the popup.
+3. **Result** — Screen names in the previous snapshot but not in the current one = **unfollowers**
 
 ## Tech Stack
 
@@ -127,10 +122,10 @@ All settings are accessible via the gear icon in the popup.
 |-----------|------------|
 | Extension Format | Chrome Manifest V3 |
 | Background | Service Worker (ES Modules) |
-| Storage | IndexedDB (snapshots & history) + chrome.storage (settings) |
-| Scheduling | chrome.alarms API |
+| Storage | IndexedDB (snapshots, followers, unfollowers, scan history) + chrome.storage (settings & scan state) |
+| Content Scripts | Page scanner (MAIN world) + message bridge (ISOLATED world) |
 | UI | Vanilla HTML/CSS/JS, X dark theme |
-| API | X's internal GraphQL (no official API key needed) |
+| Data Source | Rendered DOM of x.com followers page |
 | Build | None — zero dependencies, no bundler |
 
 ## Project Structure
@@ -143,38 +138,28 @@ XUnfollowGhost/
 │   ├── assets/icons/                     # Extension icons (16/48/128px)
 │   └── src/
 │       ├── background/
-│       │   └── service-worker.js         # Scan orchestration & scheduling
+│       │   └── service-worker.js         # Scan orchestration & data processing
 │       ├── content/
-│       │   ├── content-script.js         # Auth bridge (isolated world)
-│       │   └── page-interceptor.js       # Token extraction (page world)
+│       │   ├── content-script.js         # Message bridge (isolated world)
+│       │   └── page-scanner.js           # DOM parser + scroll pagination (main world)
 │       ├── popup/
 │       │   ├── popup.html                # Popup structure
 │       │   ├── popup.css                 # X dark theme styles
 │       │   └── popup.js                  # UI logic & rendering
 │       └── lib/
-│           ├── constants.js              # Configuration & defaults
+│           ├── constants.js              # DB config & storage keys
 │           ├── messages.js               # Message type definitions
-│           ├── db.js                     # IndexedDB wrapper
-│           ├── diff-engine.js            # Snapshot comparison
-│           └── x-api.js                  # X GraphQL API client
+│           ├── db.js                     # IndexedDB v2 wrapper (screenName-keyed)
+│           └── diff-engine.js            # Snapshot comparison (two-pointer merge)
 └── README.md
 ```
-
-## Rate Limiting & Safety
-
-The extension is designed to be respectful of X's servers:
-
-- **3-5 second delay** between each API request (with random jitter)
-- **Exponential backoff** on rate limit responses (429), starting at 60 seconds
-- **Auto-abort** after 5 consecutive rate limits to protect your account
-- **Progress tracking** so you always know the scan status
 
 ## FAQ
 
 <details>
 <summary><b>Is this safe to use? Will my account get banned?</b></summary>
 
-The extension uses the same internal API that X's own web app uses, with your existing session. It includes conservative rate limiting to avoid triggering X's abuse detection. While no third-party tool can guarantee 100% safety, XUnfollowGhost is designed to behave like a normal user browsing their followers page.
+The extension does not make any API calls. It only reads the rendered page content in your browser — the same content you see when browsing your followers page manually. No external requests are made.
 </details>
 
 <details>
@@ -186,13 +171,13 @@ The first scan creates a baseline snapshot. The extension needs two snapshots to
 <details>
 <summary><b>How long does a scan take?</b></summary>
 
-It depends on your follower count. Each page returns ~20 followers with a 3-5 second delay between requests. Approximate times: 100 followers ≈ 30 seconds, 1K followers ≈ 5 minutes, 10K followers ≈ 30 minutes, 100K followers ≈ 5 hours.
+It depends on your follower count. The extension scrolls through the followers page and parses ~20 users per scroll. A short pause between scrolls keeps things smooth. Rough estimates: 100 followers ≈ 15 seconds, 1K followers ≈ 2 minutes.
 </details>
 
 <details>
-<summary><b>Does this work with private/protected accounts?</b></summary>
+<summary><b>Can someone be falsely detected as an unfollower?</b></summary>
 
-It works for your own account regardless of privacy settings, since it uses your authenticated session.
+Yes, if a user changes their screen name. Since the extension identifies followers by screen name (not user ID — which is unavailable from the DOM), a renamed account will appear as an unfollower while the new name appears as a new follower.
 </details>
 
 <details>
@@ -202,9 +187,9 @@ All data is stored locally in your browser using IndexedDB and chrome.storage. N
 </details>
 
 <details>
-<summary><b>What if X changes their internal API?</b></summary>
+<summary><b>What if X changes their page structure?</b></summary>
 
-The extension dynamically captures API parameters from X's own requests. If X makes breaking changes, simply visit x.com to let the extension recapture the updated configuration. Fallback values are also built in.
+The extension relies on `data-testid` attributes in X's DOM (e.g. `UserCell`, `cellInnerDiv`). If X significantly changes these, the parser may need updating. This is an inherent trade-off of the DOM-parse approach.
 </details>
 
 ## Contributing
@@ -213,7 +198,7 @@ Contributions are welcome! Feel free to submit issues and pull requests.
 
 ## Disclaimer
 
-This project is for educational and personal use. It is not affiliated with, endorsed by, or associated with X Corp. Use it responsibly and at your own risk. The extension interacts with X's internal APIs which may change without notice.
+This project is for educational and personal use. It is not affiliated with, endorsed by, or associated with X Corp. Use it responsibly and at your own risk. The extension reads rendered page content which may change without notice.
 
 ## License
 

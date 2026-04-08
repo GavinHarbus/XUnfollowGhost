@@ -5,7 +5,6 @@ let dbInstance = null;
 export async function openDB() {
   if (dbInstance) {
     try {
-      // Test if connection is still alive
       dbInstance.transaction('scanHistory', 'readonly');
       return dbInstance;
     } catch {
@@ -18,34 +17,40 @@ export async function openDB() {
 
     request.onupgradeneeded = (event) => {
       const db = event.target.result;
+      const oldVersion = event.oldVersion;
 
-      if (!db.objectStoreNames.contains('snapshots')) {
+      // Clean slate or migration from v1
+      if (oldVersion < 2) {
+        // Delete old stores if they exist (v1 used userId-based keys)
+        for (const name of ['snapshots', 'followers', 'unfollowers', 'scanHistory']) {
+          if (db.objectStoreNames.contains(name)) {
+            db.deleteObjectStore(name);
+          }
+        }
+
+        // Snapshots: keyed by auto-increment id, indexed by ownerScreenName
         const snapshots = db.createObjectStore('snapshots', {
           keyPath: 'id',
           autoIncrement: true,
         });
         snapshots.createIndex('timestamp', 'timestamp');
-        snapshots.createIndex('userId', 'userId');
-      }
+        snapshots.createIndex('ownerScreenName', 'ownerScreenName');
 
-      if (!db.objectStoreNames.contains('followers')) {
+        // Followers: keyed by screenName
         const followers = db.createObjectStore('followers', {
-          keyPath: 'userId',
+          keyPath: 'screenName',
         });
-        followers.createIndex('screenName', 'screenName');
         followers.createIndex('lastSeen', 'lastSeen');
-      }
 
-      if (!db.objectStoreNames.contains('unfollowers')) {
+        // Unfollowers: auto-increment, indexed by detectedAt and screenName
         const unfollowers = db.createObjectStore('unfollowers', {
           keyPath: 'id',
           autoIncrement: true,
         });
         unfollowers.createIndex('detectedAt', 'detectedAt');
-        unfollowers.createIndex('userId', 'userId');
-      }
+        unfollowers.createIndex('screenName', 'screenName');
 
-      if (!db.objectStoreNames.contains('scanHistory')) {
+        // Scan history
         const scanHistory = db.createObjectStore('scanHistory', {
           keyPath: 'id',
           autoIncrement: true,
@@ -95,15 +100,15 @@ export async function addSnapshot(snapshot) {
   return id;
 }
 
-export async function getLatestSnapshot(userId) {
+export async function getLatestSnapshot(ownerScreenName) {
   const db = await openDB();
   const tx = db.transaction('snapshots', 'readonly');
   const store = tx.objectStore('snapshots');
-  const index = store.index('userId');
+  const index = store.index('ownerScreenName');
 
   return new Promise((resolve, reject) => {
     const results = [];
-    const range = IDBKeyRange.only(userId);
+    const range = IDBKeyRange.only(ownerScreenName);
     const request = index.openCursor(range, 'prev');
 
     request.onsuccess = (event) => {
@@ -119,15 +124,15 @@ export async function getLatestSnapshot(userId) {
   });
 }
 
-export async function getSecondLatestSnapshot(userId) {
+export async function getSecondLatestSnapshot(ownerScreenName) {
   const db = await openDB();
   const tx = db.transaction('snapshots', 'readonly');
   const store = tx.objectStore('snapshots');
-  const index = store.index('userId');
+  const index = store.index('ownerScreenName');
 
   return new Promise((resolve, reject) => {
     const results = [];
-    const range = IDBKeyRange.only(userId);
+    const range = IDBKeyRange.only(ownerScreenName);
     const request = index.openCursor(range, 'prev');
 
     request.onsuccess = (event) => {
@@ -145,26 +150,13 @@ export async function getSecondLatestSnapshot(userId) {
 
 // --- Followers ---
 
-export async function upsertFollower(record) {
-  const db = await openDB();
-  const tx = db.transaction('followers', 'readwrite');
-  const store = tx.objectStore('followers');
-  // Merge with existing record to preserve firstSeen
-  const existing = await promisifyRequest(store.get(record.userId));
-  const merged = existing
-    ? { ...existing, ...record, firstSeen: existing.firstSeen }
-    : { ...record, firstSeen: record.firstSeen || Date.now() };
-  await promisifyRequest(store.put(merged));
-  await promisifyTransaction(tx);
-}
-
 export async function upsertFollowersBatch(records) {
   const db = await openDB();
   const tx = db.transaction('followers', 'readwrite');
   const store = tx.objectStore('followers');
 
   for (const record of records) {
-    const existing = await promisifyRequest(store.get(record.userId));
+    const existing = await promisifyRequest(store.get(record.screenName));
     const merged = existing
       ? { ...existing, ...record, firstSeen: existing.firstSeen }
       : { ...record, firstSeen: record.firstSeen || Date.now() };
@@ -174,11 +166,11 @@ export async function upsertFollowersBatch(records) {
   await promisifyTransaction(tx);
 }
 
-export async function getFollower(userId) {
+export async function getFollower(screenName) {
   const db = await openDB();
   const tx = db.transaction('followers', 'readonly');
   const store = tx.objectStore('followers');
-  return promisifyRequest(store.get(userId));
+  return promisifyRequest(store.get(screenName));
 }
 
 // --- Unfollowers ---
@@ -289,8 +281,8 @@ export async function getScanCount() {
 
 // --- Stats ---
 
-export async function getStats(userId) {
-  const latestSnapshot = userId ? await getLatestSnapshot(userId) : null;
+export async function getStats(ownerScreenName) {
+  const latestSnapshot = ownerScreenName ? await getLatestSnapshot(ownerScreenName) : null;
   const totalUnfollowers = await getUnfollowerCount();
   const totalScans = await getScanCount();
 
