@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Who Unfollowed Me · X",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Track who unfollowed you on X (Twitter). One-click scan, detect ghost unfollowers, spot blue-verified accounts that left.",
   "permissions": [
     "storage",

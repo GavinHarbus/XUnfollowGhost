@@ -10,9 +10,60 @@
 
   console.log('[XUnfollowGhost] page-scanner.js loaded (DOM-parse mode)');
 
+  // ---- Intercept __INITIAL_STATE__ to capture follower count ----
+  // At document_start, X hasn't set __INITIAL_STATE__ yet.
+  // We use Object.defineProperty to intercept the exact moment X's script
+  // sets it, extracting followers_count before React hydration clears it.
+  var cachedFollowerCount = null;
+
+  function extractCountFromState(state) {
+    try {
+      if (!state || cachedFollowerCount !== null) return;
+      var users = state.entities && state.entities.users && state.entities.users.entities;
+      if (!users) return;
+      var keys = Object.keys(users);
+      for (var i = 0; i < keys.length; i++) {
+        var u = users[keys[i]];
+        if (u && typeof u.followers_count === 'number') {
+          cachedFollowerCount = u.followers_count;
+          console.log('[XUnfollowGhost] Intercepted follower count:', cachedFollowerCount);
+          return;
+        }
+      }
+    } catch (e) { /* silent */ }
+  }
+
+  (function interceptInitialState() {
+    var storedValue = window.__INITIAL_STATE__;
+    // If already set (unlikely at document_start), grab it now
+    if (storedValue) extractCountFromState(storedValue);
+
+    try {
+      Object.defineProperty(window, '__INITIAL_STATE__', {
+        get: function () { return storedValue; },
+        set: function (val) {
+          storedValue = val;
+          extractCountFromState(val);
+        },
+        configurable: true,
+        enumerable: true,
+      });
+    } catch (e) {
+      // Fallback: poll if defineProperty fails
+      var interval = setInterval(function () {
+        if (window.__INITIAL_STATE__) {
+          extractCountFromState(window.__INITIAL_STATE__);
+          if (cachedFollowerCount !== null) clearInterval(interval);
+        }
+      }, 50);
+      setTimeout(function () { clearInterval(interval); }, 5000);
+    }
+  })();
+
   // ---- State ----
   var scanAbortFlag = false;
   var isScanning = false;
+  var scanGeneration = 0; // tracks which scan "owns" isScanning
 
   // ---- Helpers ----
 
@@ -24,24 +75,16 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  // ---- Get expected follower count from __INITIAL_STATE__ ----
+  // ---- Get expected follower count ----
 
   function getExpectedFollowerCount() {
-    try {
-      var state = window.__INITIAL_STATE__;
-      if (!state) return null;
-      // Walk the state tree to find followers_count
-      // Structure: __INITIAL_STATE__.entities.users.entities[userId].followers_count
-      var users = state.entities && state.entities.users && state.entities.users.entities;
-      if (!users) return null;
-      var keys = Object.keys(users);
-      for (var i = 0; i < keys.length; i++) {
-        var u = users[keys[i]];
-        if (u && typeof u.followers_count === 'number') {
-          return u.followers_count;
-        }
-      }
-    } catch (e) { /* silent */ }
+    // Primary: from intercepted __INITIAL_STATE__ (captured via defineProperty)
+    if (cachedFollowerCount !== null) return cachedFollowerCount;
+
+    // Fallback: try live state (probably cleared by React, but worth a shot)
+    var count = extractCountFromState(window.__INITIAL_STATE__);
+    if (count) return cachedFollowerCount; // extractCountFromState sets cachedFollowerCount
+
     return null;
   }
 
@@ -68,33 +111,18 @@
         return;
       }
 
-      var link = document.querySelector(
-        'a[href="/' + screenName + '/followers"], ' +
-        'a[href="/' + screenName + '/verified_followers"]'
-      );
+      // Always use full page navigation instead of link.click().
+      // X's SPA router intercepts link clicks, causing client-side nav
+      // where the page-scanner context survives but React hasn't rendered
+      // the new content yet — leading to broken scans.
+      // Full navigation destroys this context; the auto-resume mechanism
+      // in content-script.js will re-trigger the scan on the new page.
+      console.log('[XUnfollowGhost] Full-page navigating to followers page');
+      window.location.href = 'https://x.com/' + screenName + '/followers';
 
-      if (link) {
-        console.log('[XUnfollowGhost] Clicking followers link');
-        link.click();
-      } else {
-        console.log('[XUnfollowGhost] Navigating to followers page directly');
-        window.location.href = 'https://x.com/' + screenName + '/followers';
-      }
-
-      var check = setInterval(function () {
-        var p = window.location.pathname.toLowerCase();
-        if (p.endsWith('/followers') || p.endsWith('/verified_followers')) {
-          clearInterval(check);
-          clearTimeout(to);
-          resolve(true);
-        }
-      }, 300);
-
-      var to = setTimeout(function () {
-        clearInterval(check);
-        var p = window.location.pathname.toLowerCase();
-        resolve(p.endsWith('/followers') || p.endsWith('/verified_followers'));
-      }, 10000);
+      // This context will be destroyed by the navigation.
+      // Resolve false after a timeout as a safety net (should never fire).
+      setTimeout(function () { resolve(false); }, 15000);
     });
   }
 
@@ -162,86 +190,65 @@
     return users;
   }
 
+  // Primary: extract @handle from span text (most reliable)
+  function getHandleFromCell(cell) {
+    var spans = cell.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+      var t = (spans[i].textContent || '').trim();
+      if (t.startsWith('@')) {
+        var h = t.slice(1).trim();
+        if (/^[A-Za-z0-9_]{1,15}$/.test(h)) return h.toLowerCase();
+      }
+    }
+    // Fallback: profile link href
+    var links = cell.querySelectorAll('a[href^="/"]');
+    for (var j = 0; j < links.length; j++) {
+      var href = links[j].getAttribute('href') || '';
+      var match = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+      if (match) return match[1].toLowerCase();
+    }
+    return null;
+  }
+
   function parseUserCell(cell) {
     try {
       // Find the UserCell container
       var userCell = cell.querySelector('[data-testid="UserCell"]');
       if (!userCell) return null;
 
-      // Extract screenName from profile link
-      // Look for links that point to user profiles (href="/{screenName}")
-      var profileLinks = userCell.querySelectorAll('a[role="link"]');
-      var screenName = null;
-      var displayName = null;
+      // Extract screenName — @handle text first, then link href fallback
+      var screenName = getHandleFromCell(userCell);
+      if (!screenName) return null;
 
-      for (var i = 0; i < profileLinks.length; i++) {
-        var href = profileLinks[i].getAttribute('href');
-        if (!href) continue;
-        // Skip non-profile links (e.g. /followers, /following, /i/...)
-        var match = href.match(/^\/([A-Za-z0-9_]+)$/);
-        if (match) {
-          screenName = match[1];
-          // The first link with just a username is typically the avatar link,
-          // try to get display name from a subsequent link
-          if (!displayName) {
-            // Look for text content in this or nearby links
-            var textSpans = profileLinks[i].querySelectorAll('span');
-            for (var s = 0; s < textSpans.length; s++) {
-              var text = textSpans[s].textContent.trim();
-              if (text && text !== '@' + screenName && text.length > 0) {
-                displayName = text;
-                break;
-              }
-            }
-          }
+      // Get display name from dir="auto" spans (skip @handle spans)
+      var displayName = null;
+      var nameSpans = userCell.querySelectorAll('span[dir="auto"]');
+      for (var j = 0; j < nameSpans.length; j++) {
+        var t = nameSpans[j].textContent.trim();
+        if (t && !t.startsWith('@') && t.length > 0) {
+          displayName = t;
           break;
         }
       }
-
-      if (!screenName) return null;
-
-      // Get display name if not found yet — try from dir="auto" spans
-      if (!displayName) {
-        var nameSpans = userCell.querySelectorAll('span[dir="auto"]');
-        for (var j = 0; j < nameSpans.length; j++) {
-          var t = nameSpans[j].textContent.trim();
-          if (t && !t.startsWith('@') && t.length > 0) {
-            displayName = t;
-            break;
-          }
-        }
-      }
-
       if (!displayName) displayName = screenName;
 
       // Extract avatar URL
       var avatarUrl = '';
       var avatarImg = userCell.querySelector('img[src*="pbs.twimg.com/profile_images"]');
       if (!avatarImg) {
-        // Fallback: any img inside avatar container
         avatarImg = userCell.querySelector('[data-testid^="UserAvatar"] img');
       }
       if (avatarImg) {
         avatarUrl = avatarImg.getAttribute('src') || '';
       }
 
-      // Check for verified badge
-      var isBlueVerified = false;
-      var verifiedBadge = userCell.querySelector('[data-testid="icon-verified"]');
-      if (!verifiedBadge) {
-        // Fallback: look for the verified SVG path
-        var svgs = userCell.querySelectorAll('svg[aria-label]');
-        for (var k = 0; k < svgs.length; k++) {
-          var label = svgs[k].getAttribute('aria-label') || '';
-          if (label.toLowerCase().indexOf('verified') !== -1 ||
-              label.toLowerCase().indexOf('verif') !== -1) {
-            isBlueVerified = true;
-            break;
-          }
-        }
-      } else {
-        isBlueVerified = true;
-      }
+      // Check for verified badge — multiple selector strategies
+      var isBlueVerified = !!(
+        userCell.querySelector('[data-testid="icon-verified"]') ||
+        userCell.querySelector('[data-testid*="verified"]') ||
+        userCell.querySelector('svg[aria-label*="Verified"]') ||
+        userCell.querySelector('svg[aria-label*="verified"]')
+      );
 
       return {
         screenName: screenName,
@@ -254,88 +261,50 @@
     }
   }
 
-  // ---- Wait for new content via MutationObserver ----
+  // ---- Find scroll container from UserCell parent (reference script pattern) ----
 
-  function waitForNewContent(timeoutMs) {
-    return new Promise(function (resolve) {
-      var timeline = document.querySelector('[aria-label*="Timeline"]') ||
-                     document.querySelector('section[role="region"]');
-
-      if (!timeline) {
-        // Fallback: just wait
-        setTimeout(function () { resolve(false); }, timeoutMs);
-        return;
+  function pickScroller() {
+    var cell = document.querySelector('[data-testid="UserCell"]');
+    if (!cell) return findScrollContainer();
+    var el = cell.parentElement;
+    while (el && el !== document.documentElement) {
+      var style = window.getComputedStyle(el);
+      var ov = style.overflowY;
+      // Must have scrollable overflow AND actually be taller than its viewport
+      if ((ov === 'scroll' || ov === 'auto') && el.scrollHeight > el.clientHeight + 10) {
+        return el;
       }
-
-      var resolved = false;
-      var observer = new MutationObserver(function () {
-        if (!resolved) {
-          resolved = true;
-          observer.disconnect();
-          // Small delay to let DOM settle
-          setTimeout(function () { resolve(true); }, 300);
-        }
-      });
-
-      observer.observe(timeline, { childList: true, subtree: true });
-
-      setTimeout(function () {
-        if (!resolved) {
-          resolved = true;
-          observer.disconnect();
-          resolve(false);
-        }
-      }, timeoutMs);
-    });
+      el = el.parentElement;
+    }
+    return findScrollContainer();
   }
 
-  // ---- Check if X is still loading more ----
+  // ---- Check if at bottom of scroll container ----
 
-  function isLoadingMore() {
-    // X shows a spinner while fetching the next batch
-    var spinner = document.querySelector('[role="progressbar"]');
-    if (spinner) return true;
-    // Also check for the "retry" button X shows on network errors
-    var retry = document.querySelector('[data-testid="cellInnerDiv"] [role="button"]');
-    if (retry && retry.textContent && retry.textContent.toLowerCase().indexOf('retry') !== -1) {
-      retry.click(); // auto-click retry
-      return true;
+  function isAtBottom(scroller) {
+    if (scroller) {
+      return scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
     }
-    return false;
-  }
-
-  // ---- Scroll and trigger loading ----
-
-  function scrollDown(scrollContainer) {
-    // Gradual scroll only — do NOT jump to the absolute bottom.
-    // X's virtual scroller needs the user to approach the bottom
-    // of the currently rendered content to trigger the next fetch.
-    var vh = getViewportHeight(scrollContainer);
-    var st = getScrollTop(scrollContainer);
-
-    // Scroll by ~80% of viewport
-    doScroll(scrollContainer, st + vh * 0.8);
-
-    // Also scrollIntoView on the last visible cell — this is the most
-    // reliable way to tell X's intersection-observer we reached the end.
-    var cells = document.querySelectorAll('[data-testid="cellInnerDiv"]');
-    if (cells.length > 0) {
-      setTimeout(function () {
-        cells[cells.length - 1].scrollIntoView({ behavior: 'instant', block: 'end' });
-      }, 300);
-    }
+    // Window fallback
+    var scrollTop = window.scrollY || window.pageYOffset;
+    var docHeight = document.documentElement.scrollHeight || document.body.scrollHeight;
+    return scrollTop + window.innerHeight >= docHeight - 5;
   }
 
   // ---- Main scan logic ----
 
   async function runScan() {
+    // If a previous scan is still winding down, force-abort it
     if (isScanning) {
-      post({ type: 'scan:pageError', error: 'already_scanning' });
-      return;
+      scanAbortFlag = true;
+      isScanning = false;
+      // Brief delay to let any running async code see the abort flag
+      await sleep(200);
     }
 
     isScanning = true;
     scanAbortFlag = false;
+    var myGeneration = ++scanGeneration;
 
     try {
       await doScan();
@@ -347,7 +316,10 @@
         message: 'Scan failed unexpectedly: ' + (e.message || e),
       });
     } finally {
-      isScanning = false;
+      // Only clear isScanning if we're still the active scan
+      if (scanGeneration === myGeneration) {
+        isScanning = false;
+      }
     }
   }
 
@@ -380,153 +352,100 @@
     // Step 2: Wait for initial content to load
     await sleep(3000);
 
-    // Wait until we see at least one cell
+    // Try to get expected follower count early
+    var expectedCount = getExpectedFollowerCount();
+    console.log('[XUnfollowGhost] Expected follower count:', expectedCount);
+
+    // Wait until we see at least one UserCell
     var waited = 0;
     while (waited < 10000) {
       if (scanAbortFlag) return postCancelled(screenName, 0, 0);
-      var initialCells = document.querySelectorAll('[data-testid="cellInnerDiv"]');
-      if (initialCells.length > 0) break;
+      if (document.querySelector('[data-testid="UserCell"]')) break;
       await sleep(500);
       waited += 500;
     }
 
-    // Collected users, deduplicated by screenName
+    // Step 3: Scroll-driven pagination using simple interval pattern
     var userMap = {};
     var page = 0;
+    var unchanged = 0;
+    var maxUnchangedRounds = 8; // consecutive no-new-data rounds when atBottom
 
-    // Parse initial content
-    var initialUsers = parseFollowersFromDOM();
-    for (var i = 0; i < initialUsers.length; i++) {
-      var u = initialUsers[i];
-      if (!userMap[u.screenName.toLowerCase()]) {
-        userMap[u.screenName.toLowerCase()] = u;
-      }
-    }
-
-    if (initialUsers.length > 0) {
-      page = 1;
-      var total = Object.keys(userMap).length;
-      console.log('[XUnfollowGhost] Initial parse: ' + total + ' unique users');
-      post({ type: 'scan:batch', users: objectValues(userMap), page: page });
-      post({ type: 'scan:pageDone', page: page, fetched: total, hasMore: true });
-    }
-
-    // Step 3: Scroll-driven pagination
-    var scrollContainer = findScrollContainer();
+    // Find scroller starting from UserCell (most reliable)
+    var scroller = pickScroller();
     console.log('[XUnfollowGhost] Scroll container:',
-      scrollContainer ? scrollContainer.tagName + '.' + scrollContainer.className.substring(0, 30) : 'window');
+      scroller ? scroller.tagName + '.' + scroller.className.substring(0, 30) : 'window');
 
-    var noNewDataRounds = 0;
-    var maxNoNewDataRounds = 3;
-
-    while (!scanAbortFlag && noNewDataRounds < maxNoNewDataRounds) {
-      // Scroll down to trigger loading
-      scrollDown(scrollContainer);
-
-      // Wait for new content via MutationObserver
-      await waitForNewContent(5000);
-      await sleep(600);
-
-      // If X is showing a loading spinner, wait for it to finish
-      var loadWait = 0;
-      while (isLoadingMore() && loadWait < 10000) {
-        await sleep(500);
-        loadWait += 500;
-      }
-
-      if (scanAbortFlag) break;
-
-      // Parse the DOM again and find new users
-      var allParsed = parseFollowersFromDOM();
-      var newUsers = [];
-      for (var j = 0; j < allParsed.length; j++) {
-        var key = allParsed[j].screenName.toLowerCase();
-        if (!userMap[key]) {
-          userMap[key] = allParsed[j];
-          newUsers.push(allParsed[j]);
+    // Run scan loop as a promise wrapping setInterval
+    await new Promise(function (resolve) {
+      var timer = setInterval(function () {
+        if (scanAbortFlag) {
+          clearInterval(timer);
+          resolve();
+          return;
         }
-      }
 
-      if (newUsers.length > 0) {
-        noNewDataRounds = 0;
-        page++;
-        var total2 = Object.keys(userMap).length;
-        console.log('[XUnfollowGhost] Page ' + page + ': +' + newUsers.length +
-          ' new users (total: ' + total2 + ')');
-        post({ type: 'scan:batch', users: newUsers, page: page });
-        post({ type: 'scan:pageDone', page: page, fetched: total2, hasMore: true });
-      } else {
-        noNewDataRounds++;
-        console.log('[XUnfollowGhost] No new users (attempt ' + noNewDataRounds + '/' + maxNoNewDataRounds + ')');
-      }
+        // Parse all visible cells
+        var parsed = parseFollowersFromDOM();
+        var newUsers = [];
+        for (var i = 0; i < parsed.length; i++) {
+          var key = parsed[i].screenName.toLowerCase();
+          if (!userMap[key]) {
+            userMap[key] = parsed[i];
+            newUsers.push(parsed[i]);
+          }
+        }
 
-      await sleep(800 + Math.random() * 600);
-    }
+        var total = Object.keys(userMap).length;
+
+        if (newUsers.length > 0) {
+          unchanged = 0;
+          page++;
+          console.log('[XUnfollowGhost] Page ' + page + ': +' + newUsers.length +
+            ' new users (total: ' + total + ')');
+          post({ type: 'scan:batch', users: newUsers, page: page });
+          post({ type: 'scan:pageDone', page: page, fetched: total, hasMore: true });
+        }
+
+        // Scroll down 90% of container height
+        if (scroller) {
+          scroller.scrollTop += Math.floor(scroller.clientHeight * 0.9);
+        } else {
+          window.scrollBy(0, Math.floor(window.innerHeight * 0.9));
+        }
+
+        // Track consecutive rounds with no new users
+        if (newUsers.length > 0) {
+          unchanged = 0;
+        } else {
+          unchanged++;
+        }
+
+        // Finish when no new users found for enough consecutive rounds
+        if (unchanged >= maxUnchangedRounds) {
+          clearInterval(timer);
+          resolve();
+          return;
+        }
+      }, 1200);
+    });
 
     // Step 4: Verify completeness against expected count
     var expectedCount = getExpectedFollowerCount();
     var scannedCount = Object.keys(userMap).length;
 
-    if (expectedCount && scannedCount < expectedCount && !scanAbortFlag) {
-      console.log('[XUnfollowGhost] Incomplete scan: got ' + scannedCount + '/' + expectedCount +
-        '. Running extra retry rounds...');
-
-      // Extra retry rounds to catch missing followers
-      var extraRounds = 0;
-      var maxExtraRounds = 10;
-
-      while (!scanAbortFlag && scannedCount < expectedCount && extraRounds < maxExtraRounds) {
-        extraRounds++;
-        scrollDown(scrollContainer);
-        await waitForNewContent(5000);
-        await sleep(800);
-
-        var loadWait2 = 0;
-        while (isLoadingMore() && loadWait2 < 10000) {
-          await sleep(500);
-          loadWait2 += 500;
-        }
-
-        if (scanAbortFlag) break;
-
-        var extraParsed = parseFollowersFromDOM();
-        var extraNew = [];
-        for (var e = 0; e < extraParsed.length; e++) {
-          var eKey = extraParsed[e].screenName.toLowerCase();
-          if (!userMap[eKey]) {
-            userMap[eKey] = extraParsed[e];
-            extraNew.push(extraParsed[e]);
-          }
-        }
-
-        scannedCount = Object.keys(userMap).length;
-
-        if (extraNew.length > 0) {
-          page++;
-          console.log('[XUnfollowGhost] Extra round ' + extraRounds + ': +' + extraNew.length +
-            ' new users (total: ' + scannedCount + '/' + expectedCount + ')');
-          post({ type: 'scan:batch', users: extraNew, page: page });
-          post({ type: 'scan:pageDone', page: page, fetched: scannedCount, hasMore: scannedCount < expectedCount });
-        } else {
-          // Nudge scroll
-          var st2 = getScrollTop(scrollContainer);
-          doScroll(scrollContainer, Math.max(0, st2 - 500));
-          await sleep(500);
-          doScroll(scrollContainer, st2 + 800);
-          await sleep(800);
-        }
-
-        await sleep(600 + Math.random() * 400);
-      }
-
-      if (scannedCount < expectedCount) {
-        console.warn('[XUnfollowGhost] Scan may be incomplete: got ' + scannedCount + '/' + expectedCount +
-          ' after extra rounds.');
-      } else {
+    // X's follower count often includes suspended/deactivated accounts that are
+    // NOT rendered in the DOM. A small gap (≤3 or ≤2%) is normal and expected.
+    if (expectedCount) {
+      var finalGap = expectedCount - scannedCount;
+      if (finalGap <= 0) {
         console.log('[XUnfollowGhost] Verification passed: ' + scannedCount + '/' + expectedCount);
+      } else if (finalGap <= 3 || (finalGap / expectedCount) * 100 <= 2) {
+        console.log('[XUnfollowGhost] Scan complete: ' + scannedCount + '/' + expectedCount +
+          ' (gap of ' + finalGap + ' likely suspended/deactivated accounts)');
+      } else {
+        console.warn('[XUnfollowGhost] Scan may be incomplete: ' + scannedCount + '/' + expectedCount);
       }
-    } else if (expectedCount) {
-      console.log('[XUnfollowGhost] Verification passed: ' + scannedCount + '/' + expectedCount);
     }
 
     // Step 5: Done
@@ -575,6 +494,7 @@
     }
     if (msg.type === 'page:cancelScan') {
       scanAbortFlag = true;
+      isScanning = false; // Force reset so next startScan can proceed immediately
     }
   });
 })();

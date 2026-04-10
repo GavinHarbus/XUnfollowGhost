@@ -5,6 +5,7 @@ import {
   getSecondLatestSnapshot,
   upsertFollowersBatch,
   addUnfollowers,
+  removeUnfollowersByScreenName,
   getFollower,
   addScanRecord,
   updateScanRecord,
@@ -190,17 +191,27 @@ async function runScan() {
       abortScan('Scan timed out after 10 minutes.');
     }, SCAN_TIMEOUT_MS);
   } catch (e) {
-    await updateScanRecord(scanRecordId, {
-      completedAt: Date.now(),
-      status: 'failed',
-      error: 'Failed to start scan: ' + e.message,
-    });
-    await updateScanState({ isScanning: false, progress: 0 });
-    activeScanTabId = null;
-    broadcastToPopup({
-      type: MSG.SCAN_ERROR,
-      error: 'Failed to communicate with x.com tab. Please refresh the page and try again.',
-    });
+    // Content script not injected — reload the tab and let auto-resume handle it
+    console.log('[XUnfollowGhost] Content script not reachable, reloading tab...');
+    try {
+      await chrome.tabs.reload(activeScanTabId);
+      // auto-resume in content-script.js will detect pending scan and re-trigger
+      scanTimeoutId = setTimeout(() => {
+        abortScan('Scan timed out after 10 minutes.');
+      }, SCAN_TIMEOUT_MS);
+    } catch (reloadErr) {
+      await updateScanRecord(scanRecordId, {
+        completedAt: Date.now(),
+        status: 'failed',
+        error: 'Failed to start scan: ' + reloadErr.message,
+      });
+      await updateScanState({ isScanning: false, progress: 0 });
+      activeScanTabId = null;
+      broadcastToPopup({
+        type: MSG.SCAN_ERROR,
+        error: 'Failed to communicate with x.com tab. Please open x.com and try again.',
+      });
+    }
   }
 }
 
@@ -303,6 +314,12 @@ async function handleScanFinished(message) {
           });
         }
         await addUnfollowers(unfollowerRecords);
+      }
+
+      // Remove re-followers: anyone in the current follower list
+      // should no longer be in the unfollowers store
+      if (newFollowerScreenNames.length > 0) {
+        await removeUnfollowersByScreenName(newFollowerScreenNames);
       }
     }
 

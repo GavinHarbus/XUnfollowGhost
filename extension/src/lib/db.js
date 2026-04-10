@@ -156,10 +156,12 @@ export async function upsertFollowersBatch(records) {
   const store = tx.objectStore('followers');
 
   for (const record of records) {
-    const existing = await promisifyRequest(store.get(record.screenName));
+    // Normalize key to lowercase to match diff-engine output
+    const key = record.screenName.toLowerCase();
+    const existing = await promisifyRequest(store.get(key));
     const merged = existing
-      ? { ...existing, ...record, firstSeen: existing.firstSeen }
-      : { ...record, firstSeen: record.firstSeen || Date.now() };
+      ? { ...existing, ...record, screenName: key, firstSeen: existing.firstSeen }
+      : { ...record, screenName: key, firstSeen: record.firstSeen || Date.now() };
     store.put(merged);
   }
 
@@ -219,6 +221,28 @@ export async function getUnfollowerCount() {
   const tx = db.transaction('unfollowers', 'readonly');
   const store = tx.objectStore('unfollowers');
   return promisifyRequest(store.count());
+}
+
+export async function removeUnfollowersByScreenName(screenNames) {
+  if (!screenNames || screenNames.length === 0) return;
+  const nameSet = new Set(screenNames.map((n) => n.toLowerCase()));
+  const db = await openDB();
+  const tx = db.transaction('unfollowers', 'readwrite');
+  const store = tx.objectStore('unfollowers');
+
+  return new Promise((resolve, reject) => {
+    const request = store.openCursor();
+    request.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (!cursor) { resolve(); return; }
+      if (nameSet.has((cursor.value.screenName || '').toLowerCase())) {
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => resolve();
+  });
 }
 
 // --- Scan History ---
