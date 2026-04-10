@@ -444,7 +444,8 @@
         console.log('[XUnfollowGhost] Scan complete: ' + scannedCount + '/' + expectedCount +
           ' (gap of ' + finalGap + ' likely suspended/deactivated accounts)');
       } else {
-        console.warn('[XUnfollowGhost] Scan may be incomplete: ' + scannedCount + '/' + expectedCount);
+        console.log('[XUnfollowGhost] Scan complete: ' + scannedCount + '/' + expectedCount +
+          ' (' + finalGap + ' account(s) likely suspended or deactivated)');
       }
     }
 

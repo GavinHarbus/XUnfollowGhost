@@ -22,6 +22,7 @@ const els = {
   progressFill: $('progress-fill'),
   cancelScanBtn: $('cancel-scan-btn'),
   firstScanMsg: $('first-scan-msg'),
+  followerTip: $('follower-tip'),
 
   unfollowerCount: $('unfollower-count'),
   unfollowerList: $('unfollower-list'),
@@ -292,10 +293,18 @@ function setupMessageListener() {
           setTimeout(() => els.firstScanMsg.classList.add('hidden'), 8000);
         }
 
-        // Warn if scan appears incomplete
+        // Note if scan has a small gap (suspended/deactivated accounts)
         if (message.expectedCount && message.isComplete === false) {
-          const pct = Math.round((message.totalFollowers / message.expectedCount) * 100);
-          alert(`Scan may be incomplete: found ${message.totalFollowers} of ${message.expectedCount} expected followers (${pct}%). Try scanning again.`);
+          const gap = message.expectedCount - message.totalFollowers;
+          if (gap <= 5) {
+            els.followerTip.classList.remove('hidden');
+            console.log(`[XUnfollowGhost] ${gap} account(s) not visible — likely suspended or deactivated.`);
+          } else {
+            els.followerTip.classList.remove('hidden');
+            alert(`Scan found ${message.totalFollowers} of ${message.expectedCount} followers. ${gap} account(s) may be suspended, deactivated, or failed to load.`);
+          }
+        } else {
+          els.followerTip.classList.add('hidden');
         }
 
         loadStats();

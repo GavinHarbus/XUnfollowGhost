@@ -194,6 +194,19 @@ ul {
   font-weight: 600;
 }
 
+/* ===== Tip Bar ===== */
+
+.tip-bar {
+  margin: 0 16px 12px;
+  padding: 8px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  border-left: 2px solid var(--border-color);
+}
+
 /* ===== Buttons ===== */
 
 .btn-primary {
