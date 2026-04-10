@@ -45,7 +45,7 @@ X (Twitter) doesn't tell you when someone unfollows you. Third-party services ei
 
 1. **Download** this repository:
    ```bash
-   git clone https://github.com/YourUsername/XUnfollowGhost.git
+   git clone https://github.com/AlaricDS/XUnfollowGhost.git
    ```
 
 2. Open Chrome and go to `chrome://extensions`
@@ -91,17 +91,18 @@ X (Twitter) doesn't tell you when someone unfollows you. Third-party services ei
 └─────────────────────────────────────────────────────────┘
 ```
 
-### DOM-Parse Approach
+### Scan Strategy
 
-This extension does **not** call any X API. Instead:
+The scanner uses a simple, reliable approach inspired by manual browsing:
 
-1. **Navigates** to your `/{screenName}/followers` page
-2. **Parses the rendered DOM** — reads `UserCell` elements to extract screen name, display name, avatar, and verified badge
-3. **Scrolls** to trigger X's infinite scroll and load more followers
-4. **Verifies completeness** — reads X's internal state to confirm all followers were captured; runs extra rounds if needed
-5. **Diffs snapshots** — a two-pointer merge algorithm compares sorted screen name arrays in O(n+m) time
+1. **Navigate** to `/{screenName}/followers`
+2. **Parse visible DOM cells** — extracts `@handle` text, display name, avatar, and verified badge from `[data-testid="UserCell"]` elements
+3. **Scroll & repeat** at 1.2s intervals, scrolling 90% of the viewport each round
+4. **Deduplicate** by screen name (lowercased) as X's virtual scroller recycles DOM nodes
+5. **Finish** when no new users are found for several consecutive rounds
+6. **Diff snapshots** — a two-pointer merge on sorted screen name arrays detects unfollowers in O(n+m) time
 
-The extension reads what you see on the page — nothing more.
+> **Note:** X's follower count may include suspended or deactivated accounts that don't appear in the rendered list. A small gap (1–3) between the reported count and scanned count is normal.
 
 ## Tech Stack
 
@@ -154,7 +155,13 @@ The first scan creates a baseline snapshot. The extension needs two snapshots to
 <details>
 <summary><b>How long does a scan take?</b></summary>
 
-Depends on your follower count. ~100 followers takes about 15 seconds, ~1K about 2 minutes. The extension scrolls through and parses ~20 users per round.
+Depends on your follower count. ~100 followers takes about 30 seconds, ~1K about 3 minutes. The scanner processes ~5–8 new users per 1.2s round.
+</details>
+
+<details>
+<summary><b>Why is the follower count slightly different from X?</b></summary>
+
+X's reported count may include suspended or deactivated accounts that are not rendered in the followers list. A gap of 1–3 is normal and does not affect unfollower detection.
 </details>
 
 <details>
