@@ -1,8 +1,8 @@
 <div align="center">
 
-  # Who Unfollowed Me · X
+  # XUnfollowGhost
 
-  **Find out who unfollowed you on X (Twitter) — no API key, no login, one click.**
+  **Find who unfollowed you on X — no API key, no login, one click!**
 
   ![Chrome](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)
   ![Manifest V3](https://img.shields.io/badge/Manifest-V3-34A853)
@@ -21,7 +21,7 @@
 
 X (Twitter) doesn't tell you when someone unfollows you. Third-party services either require your API key, charge a subscription, or get blocked by X's rate limits.
 
-**Who Unfollowed Me** takes a different approach — it reads your followers page directly, just like you would. No API, no tokens, no external servers. Everything runs locally in your browser.
+**XUnfollowGhost** takes a different approach — it reads your followers page directly, just like you would. No API, no tokens, no external servers. Everything runs locally in your browser.
 
 ## Features
 

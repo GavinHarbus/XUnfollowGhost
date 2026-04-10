@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Who Unfollowed Me · X",
+  "name": "XUnfollowGhost - Find who unfollowed you on X!",
   "version": "1.0.1",
   "description": "Track who unfollowed you on X (Twitter). One-click scan, detect ghost unfollowers, spot blue-verified accounts that left.",
   "permissions": [
